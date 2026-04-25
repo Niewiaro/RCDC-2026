@@ -1,201 +1,126 @@
 import asyncio
 import socket
 import struct
+import time
+from pathlib import Path
 
 from dualsense_controller import DualSenseController
 
-# config
-ESP_IP = "192.168.4.1"
+# ---------------------------------------------------------------------------
+# Konfiguracja
+# ---------------------------------------------------------------------------
+ESP_IP = "10.126.153.132"
 ESP_PORT = 4210
-RUMBLE_STOP = 0
-RUMBLE_DEFAULT = 255
-SENSITIVITY = 0.65
+SEND_PERIOD_S = 0.05  # 50 ms → 20 Hz
+STATE_FILE = Path(__file__).with_name("seq_state.txt")
 
-# global
-data_changed = False
-left_trigger = 0.0
-right_trigger = 0.0
-left_stick_x = 0.0
-button_cross = False
+RUMBLE_OFF = 0
+RUMBLE_ON = 200
+SENSITIVITY = 0.65  # bazowa czułość skrętu
 
-# list available devices and throw exception when there is no device detected
-device_infos = DualSenseController.enumerate_devices()
-if len(device_infos) < 1:
-    raise Exception("No DualSense Controller available.")
+# ---------------------------------------------------------------------------
+# Format pakietu UDP  (little-endian, 5 bajtów)
+#   H  seq_id       uint16
+#   B  pwm_drive    0-255   → PWM lewego koła
+#   B  pwm_steer    0-255   → PWM prawego koła
+#   B  motor_flags  bitmask:
+#        bit 0  da  in1_left   (lewy naprzód)
+#        bit 1  db  in2_left   (lewy wstecz)
+#        bit 2  sa  in3_right  (prawy naprzód)
+#        bit 3  sb  in4_right  (prawy wstecz)
+# ---------------------------------------------------------------------------
 
-# flag which keeps program alive
+
+# ---------------------------------------------------------------------------
+# Sekwencja pakietów – trwałość między uruchomieniami
+# ---------------------------------------------------------------------------
+def load_seq_id() -> int:
+    try:
+        return int(STATE_FILE.read_text(encoding="utf-8").strip()) & 0xFFFF
+    except (FileNotFoundError, ValueError):
+        return int(time.time() * 1000) & 0xFFFF
+
+
+def save_seq_id(value: int) -> None:
+    STATE_FILE.write_text(f"{value & 0xFFFF}\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Globalny stan kontrolera
+# ---------------------------------------------------------------------------
 is_running = True
-packet_id = 0
+data_changed = False
 
-# create an instance, use first available device
-controller = DualSenseController()
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-
-# switches the keep-alive flag, which stops the below loop
-def stop():
-    global is_running
-    is_running = False
+left_trigger: float = 0.0
+right_trigger: float = 0.0
+left_stick_x: float = 0.0
+button_cross: bool = False
 
 
-def rumble_start(value: int = RUMBLE_DEFAULT):
-    controller.left_rumble.set(value)
-    controller.right_rumble.set(value)
-
-
-def rumble_stop(value: int = RUMBLE_STOP):
-    controller.left_rumble.set(value)
-    controller.right_rumble.set(value)
-
-
-def lightbar():
-    global left_trigger, right_trigger, left_stick_x, button_cross
-
-    if left_trigger != 0.0 or button_cross:
-        controller.lightbar.set_color_red()
-    elif right_trigger != 0.0:
-        controller.lightbar.set_color_green()
-    elif left_stick_x != 0.0:
-        controller.lightbar.set_color_white()
-    else:
-        controller.lightbar.set_color_blue()
-
-
-def rumble():
-    global left_trigger, left_stick_x, button_cross
-
-    if left_trigger != 0.0 or abs(left_stick_x) >= 0.9 or button_cross:
-        rumble_start()
-    else:
-        rumble_stop()
-
-
-def on_left_trigger(value):
-    global data_changed, left_trigger
-    left_trigger = value
-    data_changed = True
-
-    rumble()
-    lightbar()
-
-
-def on_right_trigger(value):
-    global data_changed, right_trigger
-    right_trigger = value
-    data_changed = True
-
-    lightbar()
-
-
-def on_left_stick_x_changed(value):
-    global data_changed, left_stick_x
-    left_stick_x = value
-    data_changed = True
-
-    rumble()
-    lightbar()
-
-
-def on_cross_btn_pressed():
-    global data_changed, button_cross
-    button_cross = True
-    data_changed = True
-
-    rumble()
-    lightbar()
-
-
-def on_cross_btn_released():
-    global data_changed, button_cross
-    button_cross = False
-    data_changed = True
-
-    rumble()
-    lightbar()
-
-
-# callback when PlayStation button is pressed
-def on_ps_btn_pressed():
-    print("PS button pressed -> stop")
-    stop()
-
-
-# callback when an unintended error occurs, e.g. controller disconnects
-def on_error(error):
-    print(f"Oops! an error occurred: {error}")
-    stop()
-
-
-controller.left_trigger.on_change(on_left_trigger)
-controller.right_trigger.on_change(on_right_trigger)
-controller.left_stick_x.on_change(on_left_stick_x_changed)
-controller.btn_cross.on_down(on_cross_btn_pressed)
-controller.btn_cross.on_up(on_cross_btn_released)
-
-# register the button callbacks
-controller.btn_ps.on_down(on_ps_btn_pressed)
-
-# register the error callback
-controller.on_error(on_error)
-
-
-def serialize_controller_input(value):
-    return int(abs(value) * 255)
-
-
-def serialize_esp_input(value):
+# ---------------------------------------------------------------------------
+# Logika czołgowa → parametry silników
+# ---------------------------------------------------------------------------
+def _clamp_pwm(value: float) -> int:
     return min(int(abs(value)), 255)
 
 
-def serialize_data():
-    global left_trigger, right_trigger, left_stick_x, button_cross
+def compute_motor_params() -> tuple[int, bool, bool, int, bool, bool]:
+    """
+    Zwraca (pwm_left, in1_L, in2_L, pwm_right, in1_R, in2_R).
 
-    left_trigger_serialized = serialize_controller_input(left_trigger)
-    right_trigger_serialized = serialize_controller_input(right_trigger)
-    left_stick_x_serialized = serialize_controller_input(left_stick_x)
+    Mapowanie na pola pakietu:
+      pwm_left  → pwm_drive
+      pwm_right → pwm_steer
+      in1_L     → da  (bit 0)
+      in2_L     → db  (bit 1)
+      in1_R     → sa  (bit 2)
+      in2_R     → sb  (bit 3)
 
-    l_pwm = r_pwm = 0
-    in1 = in2 = in3 = in4 = 0
+    Kierunki:
+      in1=True, in2=False  → silnik DO PRZODU
+      in1=False, in2=True  → silnik DO TYŁU
+      in1=True, in2=True   → hamowanie
+      in1=False, in2=False → wybieg (brak zasilania)
+    """
+    # Hamowanie awaryjne krzyżykiem
+    if button_cross:
+        return 255, True, True, 255, True, True
+
+    raw_l = 0.0
+    raw_r = 0.0
     sensitivity = SENSITIVITY
 
-    if left_trigger > 0:
-        r_pwm += left_trigger_serialized
-        l_pwm += left_trigger_serialized
+    # Gaz
+    if left_trigger > 0.0:
         sensitivity = SENSITIVITY * left_trigger
-    elif right_trigger > 0:
-        r_pwm -= right_trigger_serialized
-        l_pwm -= right_trigger_serialized
+        raw_l += left_trigger * 255
+        raw_r += left_trigger * 255
+    elif right_trigger > 0.0:
         sensitivity = SENSITIVITY * right_trigger
+        raw_l -= right_trigger * 255
+        raw_r -= right_trigger * 255
 
-    if left_stick_x > 0:
-        r_pwm -= left_stick_x_serialized * (sensitivity + 0.2)
-        l_pwm += left_stick_x_serialized * (sensitivity + 0.2)
-    elif left_stick_x < 0:
-        r_pwm += left_stick_x_serialized * (sensitivity + 0.2)
-        l_pwm -= left_stick_x_serialized * (sensitivity + 0.2)
+    # Skręt przez różnicowanie prędkości kół
+    # stick_x > 0 → skręt w prawo: lewe koło szybciej, prawe wolniej
+    steer = left_stick_x * 255 * (sensitivity + 0.2)
+    raw_l += steer
+    raw_r -= steer
 
-    if l_pwm > 0:
-        in1 = 1
-        in2 = 0
-    elif l_pwm < 0:
-        in1 = 0
-        in2 = 1
+    pwm_l = _clamp_pwm(raw_l)
+    pwm_r = _clamp_pwm(raw_r)
 
-    if r_pwm > 0:
-        in3 = 1
-        in4 = 0
-    elif r_pwm < 0:
-        in3 = 0
-        in4 = 1
+    in1_l = raw_l > 0
+    in2_l = raw_l < 0
+    in1_r = raw_r > 0
+    in2_r = raw_r < 0
 
-    if button_cross:
-        in1 = in3 = 1
-        in2 = in4 = 1
+    return pwm_l, in1_l, in2_l, pwm_r, in1_r, in2_r
 
-    l_pwm = serialize_esp_input(l_pwm)
-    r_pwm = serialize_esp_input(r_pwm)
 
-    return [l_pwm, in1, in2, r_pwm, in3, in4]
+# ---------------------------------------------------------------------------
+# UDP
+# ---------------------------------------------------------------------------
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 
 def build_flags(da: bool, db: bool, sa: bool, sb: bool) -> int:
@@ -205,14 +130,14 @@ def build_flags(da: bool, db: bool, sa: bool, sb: bool) -> int:
 def send_to_car(
     seq_value: int, pwm_d: int, pwm_s: int, da: bool, db: bool, sa: bool, sb: bool
 ) -> None:
-    """Wysyla jeden pakiet UDP zgodny z RC_Command po stronie ESP32-S3.
+    """Wysyła pakiet UDP zgodny z RC_Command po stronie ESP32-S3.
 
     Format pakietu:
       <HBBB
       H = uint16 seq_id
-      B = pwm_drive
-      B = pwm_steer
-      B = motor_flags
+      B = pwm_drive  (PWM lewego koła)
+      B = pwm_steer  (PWM prawego koła)
+      B = motor_flags (da=in1_L, db=in2_L, sa=in1_R, sb=in2_R)
     """
     flags = build_flags(da, db, sa, sb)
     packet = struct.pack(
@@ -225,33 +150,146 @@ def send_to_car(
     sock.sendto(packet, (ESP_IP, ESP_PORT))
 
 
-async def main():
-    global is_running, data_changed, packet_id
+# ---------------------------------------------------------------------------
+# Kontroler DualSense
+# ---------------------------------------------------------------------------
+device_infos = DualSenseController.enumerate_devices()
+if not device_infos:
+    raise RuntimeError("Brak kontrolera DualSense!")
 
-    print(f"UDP target: {ESP_IP}:{ESP_PORT}")
-    print("Connecting to DualSense...")
+controller = DualSenseController()
+
+
+def _stop() -> None:
+    global is_running
+    is_running = False
+
+
+# --- Rumble & lightbar ---
+
+
+def _update_feedback() -> None:
+    moving = left_trigger > 0.0 or right_trigger > 0.0
+    turning_hard = abs(left_stick_x) >= 0.9
+
+    if moving or turning_hard or button_cross:
+        controller.left_rumble.set(RUMBLE_ON)
+        controller.right_rumble.set(RUMBLE_ON)
+    else:
+        controller.left_rumble.set(RUMBLE_OFF)
+        controller.right_rumble.set(RUMBLE_OFF)
+
+    if button_cross:
+        controller.lightbar.set_color_red()
+    elif left_trigger > 0.0:
+        controller.lightbar.set_color_green()
+    elif right_trigger > 0.0:
+        controller.lightbar.set_color_red()
+    elif abs(left_stick_x) > 0.05:
+        controller.lightbar.set_color_white()
+    else:
+        controller.lightbar.set_color_blue()
+
+
+# --- Callbacki ---
+
+
+def on_left_trigger(value: float) -> None:
+    global data_changed, left_trigger
+    left_trigger = value
+    data_changed = True
+    _update_feedback()
+
+
+def on_right_trigger(value: float) -> None:
+    global data_changed, right_trigger
+    right_trigger = value
+    data_changed = True
+    _update_feedback()
+
+
+def on_left_stick_x(value: float) -> None:
+    global data_changed, left_stick_x
+    left_stick_x = value
+    data_changed = True
+    _update_feedback()
+
+
+def on_cross_down() -> None:
+    global data_changed, button_cross
+    button_cross = True
+    data_changed = True
+    _update_feedback()
+
+
+def on_cross_up() -> None:
+    global data_changed, button_cross
+    button_cross = False
+    data_changed = True
+    _update_feedback()
+
+
+def on_ps_down() -> None:
+    print("PS → zatrzymanie programu")
+    _stop()
+
+
+def on_error(error) -> None:
+    print(f"Błąd kontrolera: {error}")
+    _stop()
+
+
+# Rejestracja callbacków
+controller.left_trigger.on_change(on_left_trigger)
+controller.right_trigger.on_change(on_right_trigger)
+controller.left_stick_x.on_change(on_left_stick_x)
+controller.btn_cross.on_down(on_cross_down)
+controller.btn_cross.on_up(on_cross_up)
+controller.btn_ps.on_down(on_ps_down)
+controller.on_error(on_error)
+
+
+# ---------------------------------------------------------------------------
+# Pętla główna
+# ---------------------------------------------------------------------------
+async def main() -> None:
+    global is_running, data_changed
+
+    seq_id = load_seq_id()
+
+    print(f"Startujemy z seq_id={seq_id}")
+    print("Podłączanie kontrolera DualSense...")
     controller.activate()
     controller.lightbar.set_color_blue()
-    print("DualSense activated!")
+    print("DualSense aktywny!")
 
     try:
         while is_running:
             if data_changed:
-                l_pwm, in1, in2, r_pwm, in3, in4 = serialize_data()
-                send_to_car(packet_id, l_pwm, r_pwm, in1 == 1, in2 == 1, in3 == 1, in4 == 1)
-                data_changed = False
+                pwm_l, in1_l, in2_l, pwm_r, in1_r, in2_r = compute_motor_params()
+                send_to_car(seq_id, pwm_l, pwm_r, in1_l, in2_l, in1_r, in2_r)
+                flags = build_flags(in1_l, in2_l, in1_r, in2_r)
                 print(
-                    f"id={packet_id} l_pwm={l_pwm} r_pwm={r_pwm} "
-                    f"in1={in1} in2={in2} in3={in3} in4={in4}"
+                    f"seq={seq_id:05d}  "
+                    f"L: pwm={pwm_l:3d} fwd={int(in1_l)} rev={int(in2_l)}  "
+                    f"R: pwm={pwm_r:3d} fwd={int(in1_r)} rev={int(in2_r)}  "
+                    f"flags=0b{flags:04b}"
                 )
-                packet_id = (packet_id + 1) & 0xFFFF
-            await asyncio.sleep(0.01)
-    except Exception as error:
-        print(f"Error: {error}")
+                seq_id = (seq_id + 1) & 0xFFFF
+                save_seq_id(seq_id)
+                data_changed = False
+
+            await asyncio.sleep(SEND_PERIOD_S)
+
+    except Exception as exc:
+        print(f"Błąd: {exc}")
     finally:
-        print("Disconnecting...")
+        print("Zatrzymywanie...")
+        # Wyślij pakiet stopu przed wyjściem
+        send_to_car(seq_id, 0, 0, False, False, False, False)
+        save_seq_id(seq_id)
         controller.deactivate()
-        sock.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
