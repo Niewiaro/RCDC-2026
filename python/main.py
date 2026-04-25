@@ -1,10 +1,12 @@
 import asyncio
-from time import sleep
+import socket
+import struct
+
 from dualsense_controller import DualSenseController
-import websockets
 
 # config
-ESP_WS_URL = "ws://192.168.4.1/ws"
+ESP_UDP_IP = "192.168.4.1"
+ESP_UDP_PORT = 4210
 RUMBLE_STOP = 0
 RUMBLE_DEFAULT = 255
 SENSITIVITY = 0.65
@@ -16,19 +18,20 @@ right_trigger = 0.0
 left_stick_x = 0.0
 button_cross = False
 
-# list availabe devices and throw exception when tzhere is no device detected
+# list available devices and throw exception when there is no device detected
 device_infos = DualSenseController.enumerate_devices()
 if len(device_infos) < 1:
     raise Exception("No DualSense Controller available.")
 
-# flag, which keeps program alive
+# flag which keeps program alive
 is_running = True
+packet_id = 0
 
 # create an instance, use first available device
 controller = DualSenseController()
 
 
-# switches the keep alive flag, which stops the below loop
+# switches the keep-alive flag, which stops the below loop
 def stop():
     global is_running
     is_running = False
@@ -67,7 +70,6 @@ def rumble():
 
 
 def on_left_trigger(value):
-    # print(f"left trigger changed: {value}")
     global data_changed, left_trigger
     left_trigger = value
     data_changed = True
@@ -77,7 +79,6 @@ def on_left_trigger(value):
 
 
 def on_right_trigger(value):
-    # print(f"right trigger changed: {value}")
     global data_changed, right_trigger
     right_trigger = value
     data_changed = True
@@ -86,7 +87,6 @@ def on_right_trigger(value):
 
 
 def on_left_stick_x_changed(value):
-    # print(f"on_left_stick_x_changed: {value}")
     global data_changed, left_stick_x
     left_stick_x = value
     data_changed = True
@@ -96,7 +96,6 @@ def on_left_stick_x_changed(value):
 
 
 def on_cross_btn_pressed():
-    # print('cross button pressed')
     global data_changed, button_cross
     button_cross = True
     data_changed = True
@@ -106,7 +105,6 @@ def on_cross_btn_pressed():
 
 
 def on_cross_btn_released():
-    # print('cross button released')
     global data_changed, button_cross
     button_cross = False
     data_changed = True
@@ -115,18 +113,15 @@ def on_cross_btn_released():
     lightbar()
 
 
-# callback, when PlayStation button is pressed
-# stop program
+# callback when PlayStation button is pressed
 def on_ps_btn_pressed():
-    print("PS button released -> stop")
+    print("PS button pressed -> stop")
     stop()
 
 
-# callback, when unintended error occurs,
-# i.e. physically disconnecting the controller during operation
-# stop program
+# callback when an unintended error occurs, e.g. controller disconnects
 def on_error(error):
-    print(f"Opps! an error occured: {error}")
+    print(f"Oops! an error occurred: {error}")
     stop()
 
 
@@ -166,7 +161,6 @@ def serialize_data():
         r_pwm += left_trigger_serialized
         l_pwm += left_trigger_serialized
         sensitivity = SENSITIVITY * left_trigger
-
     elif right_trigger > 0:
         r_pwm -= right_trigger_serialized
         l_pwm -= right_trigger_serialized
@@ -175,7 +169,6 @@ def serialize_data():
     if left_stick_x > 0:
         r_pwm -= left_stick_x_serialized * (sensitivity + 0.2)
         l_pwm += left_stick_x_serialized * (sensitivity + 0.2)
-
     elif left_stick_x < 0:
         r_pwm += left_stick_x_serialized * (sensitivity + 0.2)
         l_pwm -= left_stick_x_serialized * (sensitivity + 0.2)
@@ -201,16 +194,29 @@ def serialize_data():
     l_pwm = serialize_esp_input(l_pwm)
     r_pwm = serialize_esp_input(r_pwm)
 
-    return [l_pwm, in1, in2, r_pwm, in3, in4]
+    return [l_pwm, r_pwm, in1, in2, in3, in4]
+
+
+def build_udp_packet(packet_id_value, l_pwm, r_pwm, in1, in2, in3, in4):
+    # int id, 2x int PWM, 4x bool encoded as int
+    return struct.pack(
+        "<7i",
+        int(packet_id_value),
+        int(l_pwm),
+        int(r_pwm),
+        int(in1),
+        int(in2),
+        int(in3),
+        int(in4),
+    )
 
 
 async def main():
-    global is_running, data_changed
+    global is_running, data_changed, packet_id
 
-    print("Connecting to ESP...")
-    ws = await websockets.connect(ESP_WS_URL)
-    print("ESP connected")
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    print(f"UDP target: {ESP_UDP_IP}:{ESP_UDP_PORT}")
     print("Connecting to DualSense...")
     controller.activate()
     controller.lightbar.set_color_blue()
@@ -219,18 +225,22 @@ async def main():
     try:
         while is_running:
             if data_changed:
-                controller_data = serialize_data()
-                message = ",".join(map(str, controller_data))
-                await ws.send(message)
+                l_pwm, r_pwm, in1, in2, in3, in4 = serialize_data()
+                packet = build_udp_packet(packet_id, l_pwm, r_pwm, in1, in2, in3, in4)
+                udp_sock.sendto(packet, (ESP_UDP_IP, ESP_UDP_PORT))
                 data_changed = False
-                print(message)
+                print(
+                    f"id={packet_id} l_pwm={l_pwm} r_pwm={r_pwm} "
+                    f"in1={in1} in2={in2} in3={in3} in4={in4}"
+                )
+                packet_id += 1
             await asyncio.sleep(0.01)
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as error:
+        print(f"Error: {error}")
     finally:
         print("Disconnecting...")
-        await ws.close()
         controller.deactivate()
+        udp_sock.close()
 
 
 asyncio.run(main())
