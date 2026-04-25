@@ -1,0 +1,19 @@
+{
+    "folders": [
+        {
+            "name": "🐍 Python",
+            "path": "python"
+        },
+        {
+            "name": "🚀 ESP32",
+            "path": "RCDC-2026"
+        }
+    ],
+    "settings": {
+        "files.autoSave": "onFocusChange",
+        "editor.rulers": [
+            80,
+            120
+        ]
+    }
+}
