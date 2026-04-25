@@ -5,8 +5,8 @@ import struct
 from dualsense_controller import DualSenseController
 
 # config
-ESP_UDP_IP = "192.168.4.1"
-ESP_UDP_PORT = 4210
+ESP_IP = "192.168.4.1"
+ESP_PORT = 4210
 RUMBLE_STOP = 0
 RUMBLE_DEFAULT = 255
 SENSITIVITY = 0.65
@@ -29,6 +29,7 @@ packet_id = 0
 
 # create an instance, use first available device
 controller = DualSenseController()
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 
 # switches the keep-alive flag, which stops the below loop
@@ -194,29 +195,40 @@ def serialize_data():
     l_pwm = serialize_esp_input(l_pwm)
     r_pwm = serialize_esp_input(r_pwm)
 
-    return [l_pwm, r_pwm, in1, in2, in3, in4]
+    return [l_pwm, in1, in2, r_pwm, in3, in4]
 
 
-def build_udp_packet(packet_id_value, l_pwm, r_pwm, in1, in2, in3, in4):
-    # int id, 2x int PWM, 4x bool encoded as int
-    return struct.pack(
-        "<7i",
-        int(packet_id_value),
-        int(l_pwm),
-        int(r_pwm),
-        int(in1),
-        int(in2),
-        int(in3),
-        int(in4),
+def build_flags(da: bool, db: bool, sa: bool, sb: bool) -> int:
+    return (int(da) << 0) | (int(db) << 1) | (int(sa) << 2) | (int(sb) << 3)
+
+
+def send_to_car(
+    seq_value: int, pwm_d: int, pwm_s: int, da: bool, db: bool, sa: bool, sb: bool
+) -> None:
+    """Wysyla jeden pakiet UDP zgodny z RC_Command po stronie ESP32-S3.
+
+    Format pakietu:
+      <HBBB
+      H = uint16 seq_id
+      B = pwm_drive
+      B = pwm_steer
+      B = motor_flags
+    """
+    flags = build_flags(da, db, sa, sb)
+    packet = struct.pack(
+        "<HBBB",
+        seq_value & 0xFFFF,
+        pwm_d & 0xFF,
+        pwm_s & 0xFF,
+        flags & 0xFF,
     )
+    sock.sendto(packet, (ESP_IP, ESP_PORT))
 
 
 async def main():
     global is_running, data_changed, packet_id
 
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    print(f"UDP target: {ESP_UDP_IP}:{ESP_UDP_PORT}")
+    print(f"UDP target: {ESP_IP}:{ESP_PORT}")
     print("Connecting to DualSense...")
     controller.activate()
     controller.lightbar.set_color_blue()
@@ -225,22 +237,21 @@ async def main():
     try:
         while is_running:
             if data_changed:
-                l_pwm, r_pwm, in1, in2, in3, in4 = serialize_data()
-                packet = build_udp_packet(packet_id, l_pwm, r_pwm, in1, in2, in3, in4)
-                udp_sock.sendto(packet, (ESP_UDP_IP, ESP_UDP_PORT))
+                l_pwm, in1, in2, r_pwm, in3, in4 = serialize_data()
+                send_to_car(packet_id, l_pwm, r_pwm, in1 == 1, in2 == 1, in3 == 1, in4 == 1)
                 data_changed = False
                 print(
                     f"id={packet_id} l_pwm={l_pwm} r_pwm={r_pwm} "
                     f"in1={in1} in2={in2} in3={in3} in4={in4}"
                 )
-                packet_id += 1
+                packet_id = (packet_id + 1) & 0xFFFF
             await asyncio.sleep(0.01)
     except Exception as error:
         print(f"Error: {error}")
     finally:
         print("Disconnecting...")
         controller.deactivate()
-        udp_sock.close()
+        sock.close()
 
 
 asyncio.run(main())
